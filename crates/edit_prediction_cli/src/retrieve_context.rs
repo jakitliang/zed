@@ -177,7 +177,10 @@ pub async fn run_context_retrieval(
                     cx,
                 )
             })
-            .await?;
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect();
         merge_context_files(&mut context_files, editable_context);
     }
 

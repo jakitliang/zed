@@ -9,7 +9,7 @@ use std::{
 };
 use text::Anchor;
 use util::{paths::PathStyle, rel_path::RelPath};
-use zeta_prompt::{ContextSource, RelatedExcerpt, RelatedFile};
+use zeta_prompt::{ContextSource, EditableContextExcerpt, EditableContextFile, RelatedFile};
 
 use crate::{
     bm25_context::{Bm25ContextCandidate, collect_bm25_context},
@@ -51,7 +51,7 @@ pub async fn collect_editable_context(
     oracle_paths: Vec<Arc<Path>>,
     context_sources: Vec<ContextSource>,
     cx: &mut AsyncApp,
-) -> anyhow::Result<Vec<RelatedFile>> {
+) -> anyhow::Result<Vec<EditableContextFile>> {
     let mut ranges_by_buffer = RangesByBuffer::default();
 
     if context_sources.contains(&ContextSource::CursorExcerpt) {
@@ -118,6 +118,21 @@ pub fn limit_retrieved_context_to_bytes(
     related_files: &[RelatedFile],
     max_bytes: usize,
 ) -> Vec<RelatedFile> {
+    let editable_context = related_files
+        .iter()
+        .cloned()
+        .map(EditableContextFile::from)
+        .collect::<Vec<_>>();
+    limit_editable_context_to_bytes(&editable_context, max_bytes)
+        .into_iter()
+        .map(RelatedFile::from)
+        .collect()
+}
+
+pub fn limit_editable_context_to_bytes(
+    related_files: &[EditableContextFile],
+    max_bytes: usize,
+) -> Vec<EditableContextFile> {
     struct ExcerptCandidate {
         file_index: usize,
         excerpt_index: usize,
@@ -186,7 +201,7 @@ pub fn limit_retrieved_context_to_bytes(
                 return None;
             }
 
-            Some(RelatedFile {
+            Some(EditableContextFile {
                 path: file.path.clone(),
                 max_row: file.max_row,
                 excerpts,
@@ -196,7 +211,10 @@ pub fn limit_retrieved_context_to_bytes(
         .collect()
 }
 
-fn uncovered_excerpt_bytes(excerpt: &RelatedExcerpt, covered_ranges: &[Range<u32>]) -> usize {
+fn uncovered_excerpt_bytes(
+    excerpt: &EditableContextExcerpt,
+    covered_ranges: &[Range<u32>],
+) -> usize {
     let mut bytes = 0;
 
     for (row, line) in (excerpt.row_range.start..).zip(excerpt.text.split_inclusive('\n')) {
@@ -616,7 +634,7 @@ fn related_file_for_ranges(
     buffer: &Entity<Buffer>,
     ranges: Vec<EditableContextRange>,
     cx: &App,
-) -> Option<RelatedFile> {
+) -> Option<EditableContextFile> {
     let buffer = buffer.read(cx);
     let snapshot = buffer.snapshot();
     let file = snapshot.file()?;
@@ -632,7 +650,7 @@ fn related_file_for_ranges(
 
     let mut excerpts = ranges
         .into_iter()
-        .map(|range| RelatedExcerpt {
+        .map(|range| EditableContextExcerpt {
             row_range: range.range.start.row..range.range.end.row,
             text: snapshot
                 .text_for_range(range.range)
@@ -644,7 +662,7 @@ fn related_file_for_ranges(
         .collect::<Vec<_>>();
     excerpts.sort_by_key(|excerpt| excerpt.order);
 
-    Some(RelatedFile {
+    Some(EditableContextFile {
         path,
         max_row: snapshot.max_point().row,
         excerpts,

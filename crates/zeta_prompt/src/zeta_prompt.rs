@@ -268,6 +268,69 @@ pub enum ContextSource {
     OracleFile,
 }
 
+#[derive(Clone, Debug, PartialEq, Hash, Serialize, Deserialize)]
+pub struct EditableContextFile {
+    pub path: Arc<Path>,
+    pub max_row: u32,
+    pub excerpts: Vec<EditableContextExcerpt>,
+    #[serde(default)]
+    pub in_open_source_repo: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Hash, Serialize, Deserialize)]
+pub struct EditableContextExcerpt {
+    pub row_range: Range<u32>,
+    pub text: Arc<str>,
+    #[serde(default)]
+    pub order: usize,
+    #[serde(default)]
+    pub context_source: ContextSource,
+}
+
+impl From<RelatedFile> for EditableContextFile {
+    fn from(file: RelatedFile) -> Self {
+        Self {
+            path: file.path,
+            max_row: file.max_row,
+            excerpts: file.excerpts.into_iter().map(Into::into).collect(),
+            in_open_source_repo: file.in_open_source_repo,
+        }
+    }
+}
+
+impl From<EditableContextFile> for RelatedFile {
+    fn from(file: EditableContextFile) -> Self {
+        Self {
+            path: file.path,
+            max_row: file.max_row,
+            excerpts: file.excerpts.into_iter().map(Into::into).collect(),
+            in_open_source_repo: file.in_open_source_repo,
+        }
+    }
+}
+
+impl From<RelatedExcerpt> for EditableContextExcerpt {
+    fn from(excerpt: RelatedExcerpt) -> Self {
+        Self {
+            row_range: excerpt.row_range,
+            text: excerpt.text,
+            order: excerpt.order,
+            context_source: excerpt.context_source,
+        }
+    }
+}
+
+impl From<EditableContextExcerpt> for RelatedExcerpt {
+    fn from(excerpt: EditableContextExcerpt) -> Self {
+        Self {
+            row_range: excerpt.row_range,
+            text: excerpt.text,
+            order: excerpt.order,
+            context_source: excerpt.context_source,
+        }
+    }
+}
+
 pub fn prompt_input_contains_special_tokens(input: &ZetaPromptInput, format: ZetaFormat) -> bool {
     special_tokens_for_format(format).iter().any(|token| {
         if let Some(line_token) = token.strip_suffix('\n') {
