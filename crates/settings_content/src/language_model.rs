@@ -201,9 +201,9 @@ pub struct OllamaAvailableModel {
     pub name: String,
     /// The model's name in Zed's UI, such as in the model selector dropdown menu in the agent panel.
     pub display_name: Option<String>,
-    /// The Context Length parameter to the model (aka num_ctx or n_ctx)
-    pub max_tokens: u64,
-    /// The number of seconds to keep the connection open after the last request
+    /// Override Ollama's context length (num_ctx). Omit to use the server's configuration.
+    pub max_tokens: Option<u64>,
+    /// How long Ollama keeps the model loaded after a request. Omit to use the server's configuration.
     pub keep_alive: Option<KeepAlive>,
     /// Whether the model supports tools
     pub supports_tools: Option<bool>,

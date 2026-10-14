@@ -116,9 +116,11 @@ Zed automatically discovers models that Ollama has pulled. To disable autodiscov
 
 ### Ollama Context Length {#ollama-context}
 
-Zed requests to Ollama include context length as the `num_ctx` parameter. By default, Zed uses `4096` tokens.
+By default, Zed omits `num_ctx` from Ollama requests so that Ollama manages
+the context size using its server configuration and model parameters. Zed does
+not request the model's theoretical maximum context length automatically.
 
-Set a context length for all Ollama models:
+To explicitly request a context length for all Ollama models:
 
 ```json [settings]
 {
@@ -130,7 +132,32 @@ Set a context length for all Ollama models:
 }
 ```
 
-You can also configure context length per model with `max_tokens` in `available_models`.
+You can also configure context length per model with `max_tokens` in
+`available_models`. The global `context_window` takes precedence. Both must be
+positive integers. To restore server management, remove both overrides; model
+entries may omit `max_tokens` when only customizing names or capabilities.
+
+Zed uses the explicit context setting as its conversation budget when present.
+Otherwise, it uses a recent matching runtime capacity from Ollama's `/api/ps`,
+then its last observed capacity for the same model identity, the model's default
+`num_ctx`, or a conservative estimate of 4096 tokens.
+Budgets are bounded by the model's advertised context limit. Runtime observations
+are refreshed every 60 seconds without loading models. If the model unloads or
+the query fails, Zed keeps the last observed budget, labelled runtime unconfirmed,
+rather than resetting an existing conversation to 4096. A newly reported capacity
+replaces that budget; changing provider settings clears observations.
+The estimate is not sent to Ollama and is not a guarantee against input truncation
+or out-of-memory errors. This does not add automatic compaction for small-context
+models or dynamically resize memory as tokens arrive.
+
+### Ollama Model Residency {#ollama-residency}
+
+Zed also omits `keep_alive` by default, leaving idle unloading to Ollama rather
+than keeping models loaded indefinitely. Set `keep_alive` in a model's
+`available_models` entry to override this: `0` unloads after the request, `-1`
+keeps the model loaded indefinitely, and a duration such as `"5m"` sets an idle
+timeout. Explicit existing settings continue to apply. Ollama's server settings
+may still keep a model loaded indefinitely even when Zed omits the parameter.
 
 If your Ollama server requires a key, enter the key in the provider UI or set `OLLAMA_API_KEY`. For remote Ollama services such as Ollama Turbo, set the API URL to the remote endpoint and provide an API key.
 

@@ -10,6 +10,18 @@ use serde_json::Value;
 pub use settings::KeepAlive;
 
 pub const OLLAMA_API_URL: &str = "http://localhost:11434";
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 4096;
+
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum ContextWindowSource {
+    Explicit,
+    Runtime,
+    LastObserved,
+    ModelDefault,
+    #[default]
+    Estimate,
+}
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -17,6 +29,11 @@ pub struct Model {
     pub name: String,
     pub display_name: Option<String>,
     pub max_tokens: u64,
+    pub model_context_length: Option<u64>,
+    pub model_default_num_ctx: Option<u64>,
+    pub digest: Option<String>,
+    pub context_window_override: Option<u64>,
+    pub context_window_source: ContextWindowSource,
     pub keep_alive: Option<KeepAlive>,
     pub supports_tools: Option<bool>,
     pub supports_vision: Option<bool>,
@@ -24,42 +41,48 @@ pub struct Model {
     pub disabled: Option<String>,
 }
 
-fn get_max_tokens(_name: &str) -> u64 {
-    const DEFAULT_TOKENS: u64 = 4096;
-    DEFAULT_TOKENS
-}
-
 impl Model {
     pub fn new(
         name: &str,
-        max_tokens: Option<u64>,
+        model_context_length: Option<u64>,
         supports_tools: Option<bool>,
         supports_vision: Option<bool>,
         supports_thinking: Option<bool>,
     ) -> Self {
-        Self {
+        let mut model = Self {
             name: name.to_owned(),
             display_name: name.strip_suffix(":latest").map(ToString::to_string),
-            max_tokens: max_tokens.unwrap_or_else(|| get_max_tokens(name)),
-            keep_alive: Some(KeepAlive::indefinite()),
+            model_context_length,
             supports_tools,
             supports_vision,
             supports_thinking,
-            disabled: None,
-        }
+            ..Self::default()
+        };
+        model.resolve_context_window(None);
+        model
     }
 
     pub fn new_disabled(name: &str, reason: String) -> Self {
-        Self {
-            name: name.to_owned(),
-            display_name: name.strip_suffix(":latest").map(ToString::to_string),
-            max_tokens: get_max_tokens(name),
-            keep_alive: Some(KeepAlive::indefinite()),
-            supports_tools: None,
-            supports_vision: None,
-            supports_thinking: None,
-            disabled: Some(reason),
-        }
+        let mut model = Self::new(name, None, None, None, None);
+        model.disabled = Some(reason);
+        model
+    }
+
+    pub fn resolve_context_window(&mut self, runtime_context_length: Option<u64>) {
+        let (capacity, source) = if let Some(capacity) = self.context_window_override {
+            (capacity, ContextWindowSource::Explicit)
+        } else if let Some(capacity) = runtime_context_length.filter(|capacity| *capacity > 0) {
+            (capacity, ContextWindowSource::Runtime)
+        } else if let Some(capacity) = self.model_default_num_ctx.filter(|capacity| *capacity > 0) {
+            (capacity, ContextWindowSource::ModelDefault)
+        } else {
+            (DEFAULT_CONTEXT_WINDOW, ContextWindowSource::Estimate)
+        };
+        self.max_tokens = self
+            .model_context_length
+            .filter(|capacity| *capacity > 0)
+            .map_or(capacity, |limit| capacity.min(limit));
+        self.context_window_source = source;
     }
 
     pub fn id(&self) -> &str {
@@ -131,7 +154,8 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
-    pub keep_alive: KeepAlive,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<KeepAlive>,
     pub options: Option<ChatOptions>,
     pub tools: Vec<OllamaTool>,
     pub think: Option<bool>,
@@ -168,6 +192,37 @@ pub struct LocalModelsResponse {
     pub models: Vec<LocalModelListing>,
 }
 
+#[derive(Deserialize, Debug, Default)]
+pub struct RunningModelsResponse {
+    pub models: Vec<RunningModel>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RunningModel {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub model: String,
+    pub digest: Option<String>,
+    pub context_length: Option<u64>,
+}
+
+impl RunningModelsResponse {
+    pub fn context_length_for(&self, name: &str, digest: Option<&str>) -> Option<u64> {
+        let normalize = |name: &str| name.strip_suffix(":latest").unwrap_or(name).to_owned();
+        let mut matches = self.models.iter().filter(|model| {
+            (normalize(&model.name) == normalize(name)
+                || normalize(&model.model) == normalize(name))
+                && digest.is_none_or(|digest| model.digest.as_deref() == Some(digest))
+        });
+        let model = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        model.context_length.filter(|capacity| *capacity > 0)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct LocalModelListing {
     pub name: String,
@@ -198,6 +253,7 @@ pub struct ModelDetails {
 pub struct ModelShow {
     pub capabilities: Vec<String>,
     pub context_length: Option<u64>,
+    pub default_num_ctx: Option<u64>,
     pub architecture: Option<String>,
 }
 
@@ -235,9 +291,13 @@ impl<'de> Deserialize<'de> for ModelShow {
                         "parameters" => {
                             let params_str: String = map.next_value()?;
                             for line in params_str.lines() {
-                                if let Some(start) = line.find("num_ctx") {
-                                    let value_part = &line[start + 7..];
-                                    if let Ok(value) = value_part.trim().parse::<u64>() {
+                                let mut fields = line.split_whitespace();
+                                if fields.next() == Some("num_ctx") {
+                                    if let Some(value) = fields
+                                        .next()
+                                        .and_then(|value| value.parse::<u64>().ok())
+                                        .filter(|value| *value > 0)
+                                    {
                                         num_ctx = Some(value);
                                         break;
                                     }
@@ -265,10 +325,10 @@ impl<'de> Deserialize<'de> for ModelShow {
                     }
                 }
 
-                let context_length = num_ctx.or(context_length);
                 Ok(ModelShow {
                     capabilities,
                     context_length,
+                    default_num_ctx: num_ctx,
                     architecture,
                 })
             }
@@ -401,9 +461,159 @@ pub async fn show_model(
     Ok(details)
 }
 
+pub async fn get_running_models(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: Option<&str>,
+    extra_headers: &CustomHeaders,
+) -> Result<RunningModelsResponse> {
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(format!("{api_url}/api/ps"))
+        .timeout(std::time::Duration::from_secs(10))
+        .header("Accept", "application/json")
+        .when_some(api_key, |builder, api_key| {
+            builder.header("Authorization", format!("Bearer {api_key}"))
+        })
+        .extra_headers(extra_headers)
+        .body(AsyncBody::default())?;
+    let mut response = client.send(request).await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "Ollama running-model query failed: {}",
+        response.status()
+    );
+    let mut body = String::new();
+    response.body_mut().read_to_string(&mut body).await?;
+    serde_json::from_str(&body).context("Unable to parse Ollama running models")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_managed_options_are_omitted() -> Result<()> {
+        let mut request = ChatRequest {
+            model: "model".into(),
+            messages: vec![],
+            stream: true,
+            keep_alive: None,
+            options: Some(ChatOptions::default()),
+            tools: vec![],
+            think: None,
+        };
+        let json = serde_json::to_value(&request)?;
+        assert!(json.get("keep_alive").is_none());
+        assert_eq!(json.get("options"), Some(&serde_json::json!({})));
+        for keep_alive in [
+            KeepAlive::Seconds(0),
+            KeepAlive::Seconds(-1),
+            KeepAlive::Duration("5m".into()),
+        ] {
+            let expected = serde_json::to_value(&keep_alive)?;
+            request.keep_alive = Some(keep_alive);
+            let json = serde_json::to_value(&request)?;
+            assert_eq!(json.get("keep_alive"), Some(&expected));
+            assert!(
+                json.get("options")
+                    .and_then(|options| options.get("keep_alive"))
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_budget_does_not_allocate_model_maximum() {
+        let mut model = Model::new("model", Some(131072), None, None, None);
+        assert_eq!(model.max_tokens, 4096);
+        assert_eq!(model.context_window_source, ContextWindowSource::Estimate);
+        assert!(model.context_window_override.is_none());
+        assert!(model.keep_alive.is_none());
+        model.model_default_num_ctx = Some(8192);
+        model.resolve_context_window(None);
+        assert_eq!(model.max_tokens, 8192);
+        assert_eq!(
+            model.context_window_source,
+            ContextWindowSource::ModelDefault
+        );
+        model.resolve_context_window(Some(32768));
+        assert_eq!(model.max_tokens, 32768);
+        assert_eq!(model.context_window_source, ContextWindowSource::Runtime);
+        model.context_window_override = Some(262144);
+        model.resolve_context_window(Some(4096));
+        assert_eq!(model.max_tokens, 131072);
+        assert_eq!(model.context_window_override, Some(262144));
+        assert_eq!(model.context_window_source, ContextWindowSource::Explicit);
+        model.context_window_override = None;
+        model.resolve_context_window(None);
+        assert_eq!(model.max_tokens, 8192);
+    }
+
+    #[test]
+    fn model_parameters_require_exact_positive_num_ctx() -> Result<()> {
+        for parameters in [
+            "other_num_ctx 65536",
+            "num_ctx 0",
+            "num_ctx -1",
+            "num_ctx invalid",
+        ] {
+            let model: ModelShow =
+                serde_json::from_value(serde_json::json!({"parameters": parameters}))?;
+            assert_eq!(model.default_num_ctx, None);
+        }
+        let model: ModelShow = serde_json::from_value(
+            serde_json::json!({"parameters": "other_num_ctx 65536\nnum_ctx 8192"}),
+        )?;
+        assert_eq!(model.default_num_ctx, Some(8192));
+        Ok(())
+    }
+
+    #[test]
+    fn running_context_requires_matching_identity_and_unambiguous_runner() -> Result<()> {
+        let mut snapshot: RunningModelsResponse =
+            serde_json::from_value(serde_json::json!({"models": [
+                {"name":"model:latest", "digest":"digest", "context_length":8192},
+                {"name":"model:q8", "digest":"other", "context_length":32768},
+                {"name":"old-model"},
+                {"name":"zero-model", "context_length":0}
+            ]}))?;
+        assert_eq!(
+            snapshot.context_length_for("model", Some("digest")),
+            Some(8192)
+        );
+        assert_eq!(
+            snapshot.context_length_for("model:latest", Some("changed")),
+            None
+        );
+        assert_eq!(snapshot.context_length_for("model:q8", None), Some(32768));
+        assert_eq!(snapshot.context_length_for("old-model", None), None);
+        assert_eq!(snapshot.context_length_for("zero-model", None), None);
+        assert_eq!(snapshot.context_length_for("missing", None), None);
+        snapshot.models.push(RunningModel {
+            name: "model:latest".into(),
+            model: String::new(),
+            digest: Some("digest".into()),
+            context_length: Some(16384),
+        });
+        assert_eq!(snapshot.context_length_for("model", Some("digest")), None);
+        Ok(())
+    }
+
+    #[test]
+    fn model_configuration_can_omit_context_and_residency() -> Result<()> {
+        let config: settings::OllamaAvailableModel =
+            serde_json::from_value(serde_json::json!({"name":"model","supports_tools":true}))?;
+        assert_eq!(config.max_tokens, None);
+        assert_eq!(config.keep_alive, None);
+        let config: settings::OllamaAvailableModel = serde_json::from_value(
+            serde_json::json!({"name":"model","max_tokens":8192,"keep_alive":0}),
+        )?;
+        assert_eq!(config.max_tokens, Some(8192));
+        assert_eq!(config.keep_alive, Some(KeepAlive::Seconds(0)));
+        Ok(())
+    }
 
     #[test]
     fn parse_completion() {
@@ -566,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_show_model_with_num_ctx_preference() {
+    fn parse_show_model_separates_default_num_ctx_from_context_length() {
         let response = serde_json::json!({
             "license": "LLAMA 3.2 COMMUNITY LICENSE AGREEMENT...",
             "parameters": "num_ctx                        32768\npresence_penalty               1.5\ntemperature                    1\ntop_k                          20\ntop_p                          0.95",
@@ -619,7 +829,8 @@ mod tests {
 
         let result: ModelShow = serde_json::from_value(response).unwrap();
 
-        assert_eq!(result.context_length, Some(32768));
+        assert_eq!(result.context_length, Some(131072));
+        assert_eq!(result.default_num_ctx, Some(32768));
     }
 
     #[test]
@@ -690,7 +901,7 @@ mod tests {
                 images: Some(vec![base64_image.to_string()]),
             }],
             stream: false,
-            keep_alive: KeepAlive::default(),
+            keep_alive: None,
             options: None,
             think: None,
             tools: vec![],
@@ -710,7 +921,7 @@ mod tests {
                 images: None,
             }],
             stream: false,
-            keep_alive: KeepAlive::default(),
+            keep_alive: None,
             options: None,
             think: None,
             tools: vec![],
@@ -731,7 +942,7 @@ mod tests {
                 images: Some(vec![base64_image.to_string()]),
             }],
             stream: false,
-            keep_alive: KeepAlive::default(),
+            keep_alive: None,
             options: None,
             think: None,
             tools: vec![],
@@ -787,7 +998,7 @@ mod tests {
                 images: None,
             }],
             stream: true,
-            keep_alive: KeepAlive::default(),
+            keep_alive: None,
             options: Some(ChatOptions {
                 stop: Some(vec!["<|eot_id|>".to_string(), "<|end|>".to_string()]),
                 ..Default::default()
@@ -817,7 +1028,7 @@ mod tests {
                 images: None,
             }],
             stream: true,
-            keep_alive: KeepAlive::default(),
+            keep_alive: None,
             options: Some(ChatOptions {
                 num_ctx: Some(4096),
                 stop: None, // No stop tokens - should be omitted from JSON
