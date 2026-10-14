@@ -1,0 +1,133 @@
+name: Fork Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit to build
+        required: true
+        default: '1.23'
+        type: string
+      release_tag:
+        description: New release tag (leave empty to upload Actions artifacts only)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-windows-x64-${{ inputs.source_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      RUST_BACKTRACE: '1'
+    outputs:
+      commit: ${{ steps.metadata.outputs.commit }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out build source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+
+      - name: Validate build metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((Get-Content crates/zed/RELEASE_CHANNEL -Raw).Trim() -ne 'stable') {
+            throw 'This workflow only builds the Stable channel'
+          }
+          if ($env:RELEASE_TAG) {
+            if (-not $env:RELEASE_TAG.StartsWith('v')) { throw 'Release tag must start with v' }
+            git check-ref-format "refs/tags/$env:RELEASE_TAG"
+          }
+          $commit = git rev-parse HEAD
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "ZED_COMMIT_SHA=$commit" >> $env:GITHUB_ENV
+          rustup show
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'zed').version
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Check packaging tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe'
+          )) {
+            if (-not (Test-Path $path)) { throw "Required packaging tool missing: $path" }
+          }
+          Get-Command cmake
+
+      - name: Build official Windows x64 installer
+        run: script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Generate installer checksum
+        run: |
+          $checksum = (Get-FileHash target/Zed-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  Zed-x86_64.exe" | Set-Content target/Zed-x86_64.exe.sha256 -Encoding utf8NoBOM
+          "### Windows x64 Stable ${{ steps.metadata.outputs.version }}" >> $env:GITHUB_STEP_SUMMARY
+          "Source commit: ${{ steps.metadata.outputs.commit }}" >> $env:GITHUB_STEP_SUMMARY
+          "SHA256: $checksum" >> $env:GITHUB_STEP_SUMMARY
+          'Unsigned fork build using the upstream packaging script.' >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload Windows x64 assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-x64-${{ steps.metadata.outputs.version }}-${{ github.run_id }}
+          path: |
+            target/Zed-x86_64.exe
+            target/Zed-x86_64.exe.sha256
+            target/zed-remote-server-windows-x86_64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    if: ${{ inputs.release_tag != '' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows x64 assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-x64-${{ needs.build.outputs.version }}-${{ github.run_id }}
+          path: assets
+
+      - name: Publish fork release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ needs.build.outputs.commit }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          existing_refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" --jq '.[].ref')
+          if printf '%s\n' "$existing_refs" | grep -Fxq "refs/tags/$RELEASE_TAG"; then
+            echo "Refusing to reuse existing tag $RELEASE_TAG; choose a new tag pointing to the fixed source." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" assets/* \
+            --target "$SOURCE_COMMIT" \
+            --title "Zed $VERSION - Windows x64 (fork build)" \
+            --notes "Windows x64 Stable fork build from commit $SOURCE_COMMIT, packaged with the upstream script. Unsigned; not an official Zed release." \
+            --latest=false
