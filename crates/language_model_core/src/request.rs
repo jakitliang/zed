@@ -466,6 +466,29 @@ pub enum CompletionIntent {
     GenerateGitCommitMessage,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContextSize {
+    #[default]
+    Auto,
+    Quarter,
+    Half,
+    ThreeQuarters,
+    Full,
+}
+
+impl ContextSize {
+    pub fn num_ctx(self, model_limit: u64) -> Option<u64> {
+        let quarters = match self {
+            Self::Auto => return None,
+            Self::Quarter => 1,
+            Self::Half => 2,
+            Self::ThreeQuarters => 3,
+            Self::Full => 4,
+        };
+        Some((model_limit / 4 * quarters + model_limit % 4 * quarters / 4).max(1))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelRequest {
     pub thread_id: Option<String>,
@@ -481,6 +504,8 @@ pub struct LanguageModelRequest {
     pub tool_choice: Option<LanguageModelToolChoice>,
     pub stop: Vec<String>,
     pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<ContextSize>,
     pub thinking_allowed: bool,
     pub thinking_effort: Option<String>,
     pub speed: Option<Speed>,

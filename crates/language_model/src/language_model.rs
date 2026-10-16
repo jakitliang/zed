@@ -146,6 +146,8 @@ pub struct LanguageModel {
     pub supports_split_token_display: bool,
     /// The model's context-window capacity.
     pub max_token_count: u64,
+    /// The advertised model limit, independent of the currently loaded context window.
+    pub context_window_limit: Option<u64>,
     /// The input ceiling before reserving output from any shared window.
     /// Equals `max_token_count` unless the model has a separate prompt limit.
     pub max_input_tokens: u64,
@@ -215,6 +217,7 @@ impl LanguageModel {
             supports_streaming_tools: false,
             supports_split_token_display: false,
             max_token_count,
+            context_window_limit: None,
             max_input_tokens: max_token_count,
             max_output_tokens: None,
         }

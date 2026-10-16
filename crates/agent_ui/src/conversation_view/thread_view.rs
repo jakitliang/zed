@@ -56,6 +56,24 @@ use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
+fn context_size_label(context_size: language_model::ContextSize, model_limit: u64) -> String {
+    let Some(tokens) = context_size.num_ctx(model_limit) else {
+        return "Auto".to_string();
+    };
+    let (divisor, suffix) = if tokens >= 1024 * 1024 {
+        (1024 * 1024, "M")
+    } else if tokens >= 1024 {
+        (1024, "K")
+    } else {
+        return tokens.to_string();
+    };
+    let value = format!("{:.2}", tokens as f64 / divisor as f64);
+    format!(
+        "{}{suffix}",
+        value.trim_end_matches('0').trim_end_matches('.')
+    )
+}
+
 #[derive(Default)]
 struct ThreadFeedbackState {
     feedback: Option<ThreadFeedback>,
@@ -624,6 +642,7 @@ pub struct ThreadView {
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
+    context_size_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub fast_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub project: WeakEntity<Project>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
@@ -1041,6 +1060,7 @@ impl ThreadView {
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
+            context_size_menu_handle: PopoverMenuHandle::default(),
             fast_mode_menu_handle: PopoverMenuHandle::default(),
             project,
             code_span_resolver,
@@ -4701,7 +4721,8 @@ impl ThreadView {
                                         Some(config_view) => this.child(config_view),
                                         None => this
                                             .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
+                                            .children(self.model_selector.clone())
+                                            .children(self.render_context_size_control(cx)),
                                     })
                                     .child(self.render_send_button(cx)),
                             ),
@@ -4931,6 +4952,81 @@ impl ThreadView {
         self.as_native_thread(cx)
             .and_then(|thread| thread.read(cx).model())
             .is_some_and(|model| model.supports_split_token_display())
+    }
+
+    fn render_context_size_control(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        use language_model::ContextSize;
+
+        let thread = self.as_native_thread(cx)?;
+        let thread_ref = thread.read(cx);
+        let model = thread_ref.model()?;
+        if model.provider_id().0.as_ref() != "ollama" {
+            return None;
+        }
+        let selected = thread_ref.context_size();
+        let options = [
+            ContextSize::Auto,
+            ContextSize::Quarter,
+            ContextSize::Half,
+            ContextSize::ThreeQuarters,
+            ContextSize::Full,
+        ]
+        .into_iter()
+        .filter_map(|value| {
+            if value == ContextSize::Auto {
+                Some((value, "Auto".to_string()))
+            } else {
+                model
+                    .context_window_limit
+                    .map(|limit| (value, context_size_label(value, limit)))
+            }
+        })
+        .collect::<Vec<_>>();
+        let label = options
+            .iter()
+            .find(|(value, _)| *value == selected)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| "Auto".to_string());
+        let (color, icon) = if self.context_size_menu_handle.is_deployed() {
+            (Color::Accent, IconName::ChevronUp)
+        } else {
+            (Color::Muted, IconName::ChevronDown)
+        };
+        let thread = thread.downgrade();
+
+        Some(
+            PopoverMenu::new("context-size-selector")
+                .trigger(
+                    Button::new("context-size", label)
+                        .label_size(LabelSize::Small)
+                        .color(color)
+                        .end_icon(Icon::new(icon).color(Color::Muted).size(IconSize::XSmall))
+                        .tooltip(Tooltip::text("Context Size")),
+                )
+                .menu(move |window, cx| {
+                    Some(ContextMenu::build(window, cx, |mut menu, _, _| {
+                        menu = menu.header("Context Size");
+                        for (context_size, label) in &options {
+                            let context_size = *context_size;
+                            let thread = thread.clone();
+                            menu = menu.item(
+                                ContextMenuEntry::new(label.clone())
+                                    .toggleable(IconPosition::End, selected == context_size)
+                                    .handler(move |_, cx| {
+                                        thread
+                                            .update(cx, |thread, cx| {
+                                                thread.set_context_size(context_size, cx);
+                                            })
+                                            .log_err();
+                                    }),
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .with_handle(self.context_size_menu_handle.clone())
+                .anchor(gpui::Anchor::BottomRight),
+        )
     }
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -13170,6 +13266,24 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_context_size_labels() {
+        use language_model::ContextSize;
+
+        for (context_size, limit, expected) in [
+            (ContextSize::Auto, 262144, "Auto"),
+            (ContextSize::Quarter, 262144, "64K"),
+            (ContextSize::Half, 262144, "128K"),
+            (ContextSize::ThreeQuarters, 262144, "192K"),
+            (ContextSize::Full, 262144, "256K"),
+            (ContextSize::Full, 1048576, "1M"),
+            (ContextSize::ThreeQuarters, 2097152, "1.5M"),
+            (ContextSize::Full, 1536, "1.5K"),
+        ] {
+            assert_eq!(context_size_label(context_size, limit), expected);
+        }
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {

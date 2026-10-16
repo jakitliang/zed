@@ -816,6 +816,7 @@ mod tests {
         );
 
         let request = LanguageModelRequest {
+            context_size: None,
             messages: vec![
                 language_model::LanguageModelRequestMessage {
                     role: Role::System,
@@ -972,6 +973,7 @@ mod tests {
         );
 
         let request = LanguageModelRequest {
+            context_size: None,
             messages: vec![
                 language_model::LanguageModelRequestMessage {
                     role: Role::System,
@@ -1040,6 +1042,7 @@ mod tests {
         );
 
         let request = LanguageModelRequest {
+            context_size: None,
             messages: vec![
                 language_model::LanguageModelRequestMessage {
                     role: Role::System,

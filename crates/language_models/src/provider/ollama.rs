@@ -421,7 +421,17 @@ impl OllamaLanguageModelProvider {
         config: &ollama::Model,
         request: LanguageModelRequest,
     ) -> Result<ChatRequest> {
-        if let Some(context_window) = config.context_window_override {
+        let num_ctx = match request.context_size {
+            Some(language_model::ContextSize::Auto) => None,
+            Some(context_size) => context_size.num_ctx(
+                config
+                    .model_context_length
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| anyhow!("Ollama model context limit is unknown"))?,
+            ),
+            None => config.context_window_override,
+        };
+        if let Some(context_window) = num_ctx {
             anyhow::ensure!(
                 context_window > 0 && context_window <= i64::MAX as u64,
                 "Ollama context window must be between 1 and {}",
@@ -540,7 +550,7 @@ impl OllamaLanguageModelProvider {
             keep_alive: config.keep_alive.clone(),
             stream: true,
             options: Some(ChatOptions {
-                num_ctx: config.context_window_override,
+                num_ctx,
                 num_predict: request.max_output_tokens.map(isize::try_from).transpose()?,
                 // Only send stop tokens if explicitly provided. When empty/None,
                 // Ollama will use the model's default stop tokens from its Modelfile.
@@ -715,6 +725,7 @@ impl LanguageModelClient for OllamaLanguageModelProvider {
 
 fn language_model(model: &ollama::Model) -> LanguageModel {
     LanguageModel {
+        context_window_limit: model.model_context_length.filter(|limit| *limit > 0),
         supports_tools: model.supports_tools.unwrap_or(false),
         supports_images: model.supports_vision.unwrap_or(false),
         supports_thinking: model.supports_thinking.unwrap_or(false),
@@ -1366,6 +1377,41 @@ fn tool_into_ollama(tool: LanguageModelRequestTool) -> Result<ollama::OllamaTool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_context_size_uses_model_limit_and_auto_omits_num_ctx() -> Result<()> {
+        use language_model::ContextSize;
+
+        let mut model = ollama::Model::new("model", Some(131072), None, None, None);
+        model.context_window_override = Some(8192);
+        model.resolve_context_window(Some(32768));
+
+        assert_eq!(language_model(&model).context_window_limit, Some(131072));
+
+        for (context_size, expected) in [
+            (ContextSize::Auto, None),
+            (ContextSize::Quarter, Some(32768)),
+            (ContextSize::Half, Some(65536)),
+            (ContextSize::ThreeQuarters, Some(98304)),
+            (ContextSize::Full, Some(131072)),
+        ] {
+            let request = LanguageModelRequest {
+                context_size: Some(context_size),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(OllamaLanguageModelProvider::to_ollama_request(
+                &model, request,
+            )?)?;
+            assert_eq!(
+                json["options"]
+                    .get("num_ctx")
+                    .and_then(|value| value.as_u64()),
+                expected
+            );
+            assert_eq!(json["options"].get("num_ctx").is_none(), expected.is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn requests_only_override_explicit_context_and_residency() -> Result<()> {

@@ -549,6 +549,7 @@ impl CodegenAlternative {
             ];
 
             LanguageModelRequest {
+                context_size: None,
                 thread_id: Some(session_id),
                 prompt_cache_key: None,
                 prompt_id: None,
@@ -633,6 +634,7 @@ impl CodegenAlternative {
             request_message.content.push(prompt.into());
 
             LanguageModelRequest {
+                context_size: None,
                 thread_id: Some(session_id),
                 prompt_cache_key: None,
                 prompt_id: None,

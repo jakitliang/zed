@@ -279,6 +279,7 @@ pub fn into_open_ai_response(
     let stream = !model_id.starts_with("o1-");
 
     let LanguageModelRequest {
+        context_size: _,
         thread_id,
         prompt_cache_key,
         prompt_id: _,
@@ -1852,6 +1853,7 @@ mod tests {
         let expected_image_url = user_image.to_base64_url();
 
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: Some("thread-123".into()),
             prompt_cache_key: None,
             prompt_id: None,
@@ -2060,6 +2062,7 @@ mod tests {
         };
 
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2155,6 +2158,7 @@ mod tests {
         };
 
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2248,6 +2252,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_replays_reasoning_without_encrypted_content() {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2330,6 +2335,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_omits_reasoning_when_thinking_is_disabled_and_none_is_unsupported() {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2441,6 +2447,7 @@ mod tests {
             (Some(Speed::Fast), Some("priority")),
         ] {
             let request = LanguageModelRequest {
+                context_size: None,
                 thread_id: None,
                 prompt_cache_key: None,
                 prompt_id: None,
@@ -2495,6 +2502,7 @@ mod tests {
             (Some(Speed::Fast), Some("priority")),
         ] {
             let request = LanguageModelRequest {
+                context_size: None,
                 thread_id: None,
                 prompt_cache_key: None,
                 prompt_id: None,
@@ -2542,6 +2550,7 @@ mod tests {
     #[test]
     fn into_open_ai_can_send_max_tokens_parameter() -> Result<()> {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2620,6 +2629,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_sends_none_reasoning_when_thinking_is_disabled() -> Result<()> {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2663,6 +2673,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_uses_default_effort_when_selected_effort_is_none() -> Result<()> {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2708,6 +2719,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_replays_assistant_phase() {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2804,6 +2816,7 @@ mod tests {
             ]
         });
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -2884,6 +2897,7 @@ mod tests {
     #[test]
     fn into_open_ai_response_replays_reasoning_details_but_not_thinking_text() {
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,
@@ -4185,6 +4199,7 @@ mod tests {
             output: None,
         };
         let request = LanguageModelRequest {
+            context_size: None,
             thread_id: None,
             prompt_cache_key: None,
             prompt_id: None,

@@ -123,6 +123,126 @@ pub enum SandboxStatusRefresh {
 /// the user instead.
 pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Context usage reached the {threshold:.1}% safety limit; the response was stopped. Compact the conversation or start a new thread to continue."
+)]
+struct ContextBudgetExceeded {
+    threshold: f64,
+}
+
+fn context_stop_ratio(capacity: u64) -> f64 {
+    (0.90 + 0.018 * (capacity.max(1) as f64 / 32768.0).log2()).clamp(0.90, 0.99)
+}
+
+fn estimated_token_units(text: &str) -> u64 {
+    // ASCII prose averages roughly four characters per token; non-ASCII text
+    // needs a more conservative estimate when no provider tokenizer is available.
+    text.chars()
+        .map(|character| if character.is_ascii() { 1 } else { 4 })
+        .sum()
+}
+
+fn estimated_content_units(content: &MessageContent) -> u64 {
+    match content {
+        MessageContent::Text(text) | MessageContent::Thinking { text, .. } => {
+            estimated_token_units(text)
+        }
+        MessageContent::ToolUse(tool_use) => estimated_token_units(&tool_use.raw_input) + 32,
+        MessageContent::ToolResult(result) => estimated_tool_result_units(result),
+        MessageContent::Image(_) => 4096,
+        MessageContent::RedactedThinking(_) | MessageContent::Compaction(_) => 0,
+    }
+}
+
+fn estimated_tool_result_units(result: &LanguageModelToolResult) -> u64 {
+    32 + result
+        .content
+        .iter()
+        .map(|content| match content {
+            LanguageModelToolResultContent::Text(text) => estimated_token_units(text),
+            LanguageModelToolResultContent::Image(_) => 4096,
+        })
+        .sum::<u64>()
+}
+
+struct ContextBudget {
+    capacity: u64,
+    input_units: u64,
+    added_units: u64,
+    tool_result_units: u64,
+    tool_inputs: HashMap<LanguageModelToolUseId, u64>,
+    tool_results: HashSet<LanguageModelToolUseId>,
+}
+
+impl ContextBudget {
+    fn new(capacity: u64, request: &LanguageModelRequest) -> Result<Self> {
+        let mut input_units = 0;
+        for message in &request.messages {
+            input_units += 16;
+            for content in &message.content {
+                input_units += estimated_content_units(content);
+            }
+        }
+        for tool in &request.tools {
+            input_units += estimated_token_units(&serde_json::to_string(tool)?);
+        }
+        Ok(Self {
+            capacity,
+            input_units,
+            added_units: 0,
+            tool_result_units: 0,
+            tool_inputs: HashMap::default(),
+            tool_results: HashSet::default(),
+        })
+    }
+
+    fn check(&self) -> Result<()> {
+        let limit = (self.capacity as f64 * context_stop_ratio(self.capacity)).floor() as u64;
+        if self
+            .input_units
+            .saturating_add(self.added_units)
+            .saturating_add(self.tool_result_units)
+            .div_ceil(4)
+            >= limit
+        {
+            return Err(ContextBudgetExceeded {
+                threshold: context_stop_ratio(self.capacity) * 100.0,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn record_event(&mut self, event: &LanguageModelCompletionEvent) {
+        match event {
+            LanguageModelCompletionEvent::Text(text)
+            | LanguageModelCompletionEvent::Thinking { text, .. } => {
+                self.added_units += estimated_token_units(text);
+            }
+            LanguageModelCompletionEvent::ToolUse(tool_use) => {
+                let units = estimated_token_units(&tool_use.raw_input) + 32;
+                let previous = self.tool_inputs.entry(tool_use.id.clone()).or_default();
+                self.added_units += units.saturating_sub(*previous);
+                *previous = (*previous).max(units);
+            }
+            LanguageModelCompletionEvent::UsageUpdate(usage) => {
+                if total_input_tokens(*usage) > 0 {
+                    self.input_units = total_input_tokens(*usage).saturating_mul(4);
+                    self.added_units = usage.output_tokens.saturating_mul(4);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_tool_result(&mut self, result: &LanguageModelToolResult) {
+        if self.tool_results.insert(result.tool_use_id.clone()) {
+            self.tool_result_units += estimated_tool_result_units(result);
+        }
+    }
+}
+
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
@@ -1310,6 +1430,7 @@ pub struct Thread {
     summarization_model: Option<LanguageModel>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
+    context_size: language_model::ContextSize,
     speed: Option<Speed>,
     prompt_capabilities_tx: watch::Sender<acp::PromptCapabilities>,
     pub(crate) prompt_capabilities_rx: watch::Receiver<acp::PromptCapabilities>,
@@ -1461,6 +1582,7 @@ impl Thread {
             thinking_enabled: enable_thinking,
             speed,
             thinking_effort,
+            context_size: language_model::ContextSize::Auto,
             prompt_capabilities_tx,
             prompt_capabilities_rx,
             project,
@@ -1834,6 +1956,7 @@ impl Thread {
             summarization_model: None,
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
+            context_size: language_model::ContextSize::Auto,
             speed: db_thread.speed,
             project,
             action_log,
@@ -2012,6 +2135,19 @@ impl Thread {
 
     pub fn thread_model(&self) -> &ThreadModel {
         &self.model
+    }
+
+    pub fn context_size(&self) -> language_model::ContextSize {
+        self.context_size
+    }
+
+    pub fn set_context_size(
+        &mut self,
+        context_size: language_model::ContextSize,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_size = context_size;
+        cx.notify();
     }
 
     pub(crate) fn ensure_model(
@@ -2761,6 +2897,10 @@ impl Thread {
 
                 _ = this.update(cx, |this, cx| this.flush_pending_message(cx));
 
+                let budget_exceeded = turn_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is::<ContextBudgetExceeded>());
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
@@ -2783,7 +2923,13 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, _| {
+                    if let Some(mut turn) = this.running_turn.take() {
+                        if budget_exceeded {
+                            turn.cancellation_tx.send(true).log_err();
+                        }
+                    }
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(event_stream, tools, cancellation_tx, task));
@@ -2890,6 +3036,21 @@ impl Thread {
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model);
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
+                let budget = if model.provider_id().0.as_ref() == "ollama" {
+                    let capacity = this
+                        .context_size
+                        .num_ctx(model.context_window_limit.unwrap_or(model.max_token_count))
+                        .unwrap_or(model.max_token_count);
+                    Some(ContextBudget::new(capacity, &request)?)
+                } else {
+                    None
+                };
+                if let Some(budget) = budget.as_ref() {
+                    budget.check()?;
+                }
+                if let Some(turn) = this.running_turn.as_mut() {
+                    turn.context_budget = budget;
+                }
                 this.current_request_token_usage = TokenUsage::default();
                 anyhow::Ok((model, provider, request))
             })??;
@@ -2938,6 +3099,23 @@ impl Thread {
                             .unwrap_or(false);
 
                         early_tool_results.push((owning_message_ix, tool_result));
+
+                        let budget_result = this.update(cx, |this, cx| {
+                            if let Some(budget) = this.running_turn.as_mut()
+                                .and_then(|turn| turn.context_budget.as_mut())
+                            {
+                                if let Some((_, result)) = early_tool_results.last() {
+                                    budget.record_tool_result(result);
+                                }
+                            }
+                            this.check_context_budget(cx)
+                        })?;
+                        if let Err(error) = budget_result {
+                            for (owning_message_ix, tool_result) in early_tool_results {
+                                Self::process_tool_result(this, event_stream, cx, owning_message_ix, tool_result)?;
+                            }
+                            return Err(error);
+                        }
 
                         // Only break if the tool errored and we are still
                         // streaming the input of the tool. If the tool errored
@@ -3010,6 +3188,23 @@ impl Thread {
                         log::info!("Model refused request; checking for fallback model");
                         had_refusal = true;
                         break;
+                    }
+                    if err.is::<ContextBudgetExceeded>() {
+                        this.update(cx, |this, _| {
+                            if let Some(turn) = this.running_turn.as_mut() {
+                                turn.streaming_tool_inputs.clear();
+                            }
+                        })?;
+                        for (owning_message_ix, tool_result) in early_tool_results {
+                            Self::process_tool_result(
+                                this,
+                                event_stream,
+                                cx,
+                                owning_message_ix,
+                                tool_result,
+                            )?;
+                        }
+                        return Err(err);
                     }
                     error = Some(err.downcast()?);
                     break;
@@ -3098,6 +3293,7 @@ impl Thread {
             }
             while let Some((owning_message_ix, tool_result)) = tool_results.next().await {
                 Self::process_tool_result(this, event_stream, cx, owning_message_ix, tool_result)?;
+                this.read_with(cx, |this, cx| this.check_context_budget(cx))??;
             }
 
             this.update(cx, |this, cx| {
@@ -3362,6 +3558,13 @@ impl Thread {
             None,
         );
         this.update(cx, |this, _cx| {
+            if let Some(budget) = this
+                .running_turn
+                .as_mut()
+                .and_then(|turn| turn.context_budget.as_mut())
+            {
+                budget.record_tool_result(&tool_result);
+            }
             this.pending_message()
                 .tool_results
                 .insert(tool_result.tool_use_id.clone(), tool_result)
@@ -3432,6 +3635,17 @@ impl Thread {
         log::trace!("Handling streamed completion event: {:?}", event);
         use LanguageModelCompletionEvent::*;
 
+        if let Some(budget) = self
+            .running_turn
+            .as_mut()
+            .and_then(|turn| turn.context_budget.as_mut())
+        {
+            budget.record_event(&event);
+            if matches!(event, ToolUse(_)) {
+                budget.check()?;
+            }
+        }
+
         match event {
             StartMessage { .. } => {
                 self.flush_pending_message(cx);
@@ -3500,7 +3714,20 @@ impl Thread {
             Started | Queued { .. } | Compaction(_) => {}
         }
 
+        self.check_context_budget(cx)?;
         Ok(None)
+    }
+
+    fn check_context_budget(&self, cx: &App) -> Result<()> {
+        if self.compaction_message_target_ix(cx).is_none()
+            && let Some(budget) = self
+                .running_turn
+                .as_ref()
+                .and_then(|turn| turn.context_budget.as_ref())
+        {
+            budget.check()?;
+        }
+        Ok(())
     }
 
     fn handle_text_event(&mut self, new_text: String, event_stream: &ThreadEventStream) {
@@ -4195,6 +4422,7 @@ impl Thread {
             tool_choice: None,
             stop: Vec::new(),
             temperature: AgentSettings::temperature_for_model(model, cx),
+            context_size: Some(self.context_size),
             // Models that can't run with thinking disabled ignore the
             // toggle state, which may be stale from a previously selected
             // model that could.
@@ -4864,6 +5092,7 @@ enum CompactionInsertion {
 }
 
 struct RunningTurn {
+    context_budget: Option<ContextBudget>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -4890,6 +5119,7 @@ impl RunningTurn {
         task: Task<()>,
     ) -> Self {
         Self {
+            context_budget: None,
             _task: task,
             event_stream,
             tools,
@@ -6999,6 +7229,80 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn context_budget_threshold_curve() {
+        for (capacity, expected) in [
+            (0, 0.90),
+            (2048, 0.90),
+            (32768, 0.90),
+            (65536, 0.918),
+            (131072, 0.936),
+            (262144, 0.954),
+            (524288, 0.972),
+            (1048576, 0.99),
+            (2097152, 0.99),
+        ] {
+            assert!((context_stop_ratio(capacity) - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn context_budget_stream_and_tool_results() {
+        let mut budget =
+            ContextBudget::new(2048, &LanguageModelRequest::default()).expect("budget");
+        budget.record_event(&LanguageModelCompletionEvent::Text("a".repeat(4000)));
+        assert!(budget.check().is_ok());
+        budget.record_event(&LanguageModelCompletionEvent::Thinking {
+            text: "a".repeat(1000),
+            signature: None,
+        });
+        let result = LanguageModelToolResult {
+            tool_use_id: LanguageModelToolUseId::from("test"),
+            tool_name: Arc::from("read_file"),
+            is_error: false,
+            content: vec!["a".repeat(2000).into()],
+            output: None,
+        };
+        budget.record_tool_result(&result);
+        let units = budget.tool_result_units;
+        budget.record_tool_result(&result);
+        assert_eq!(budget.tool_result_units, units);
+        assert!(budget.check().is_ok());
+        budget.record_event(&LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 400,
+            ..Default::default()
+        }));
+        assert_eq!(budget.tool_result_units, units);
+        assert!(budget.check().is_err());
+    }
+
+    #[test]
+    fn context_budget_counts_request_and_stops_at_threshold() {
+        let request = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec!["a".repeat(4000).into()],
+                cache: false,
+                reasoning_details: None,
+            }],
+            tools: vec![LanguageModelRequestTool::function(
+                "read".into(),
+                "description".repeat(20),
+                json!({"type": "object"}),
+                false,
+            )],
+            ..Default::default()
+        };
+        let mut budget = ContextBudget::new(2048, &request).expect("budget");
+        assert!(budget.input_units > 4016);
+        budget.input_units = 1842 * 4;
+        assert!(budget.check().is_ok());
+        budget.input_units = 1843 * 4;
+        assert!(budget.check().is_err());
+        assert_eq!(estimated_token_units("中文"), 8);
+    }
+
+    #[test]
     fn compaction_capacity_respects_prompt_and_combined_limits() {
         assert_eq!(
             compaction_input_capacity(90_000, Some(200_000), Some(16_384)),
@@ -7020,6 +7324,35 @@ mod tests {
             compaction_input_capacity(128_000, Some(128_000), None),
             128_000
         );
+    }
+
+    #[gpui::test]
+    async fn context_budget_stops_stream_and_prevents_tool_start(cx: &mut TestAppContext) {
+        let (thread, event_stream, _) = setup_thread_for_test(cx).await;
+        thread.update(cx, |thread, cx| {
+            let (cancellation_tx, cancellation_rx) = watch::channel(false);
+            let mut turn = RunningTurn::new(
+                event_stream.clone(), BTreeMap::default(), cancellation_tx, Task::ready(()),
+            );
+            turn.context_budget = Some(ContextBudget::new(2048, &LanguageModelRequest::default()).expect("budget"));
+            thread.running_turn = Some(turn);
+            let result = thread.handle_completion_event(
+                LanguageModelCompletionEvent::Text("a".repeat(8000)),
+                &event_stream, cancellation_rx.clone(), cx,
+            );
+            assert!(result.expect_err("must stop text stream").is::<ContextBudgetExceeded>());
+            assert!(matches!(thread.pending_message().content.last(), Some(AgentMessageContent::Text(text)) if text.len() == 8000));
+            let result = thread.handle_completion_event(
+                LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                    id: LanguageModelToolUseId::from("blocked"), name: Arc::from("read_file"),
+                    raw_input: "{}".into(), input: language_model::LanguageModelToolUseInput::Json(json!({})),
+                    is_input_complete: true, thought_signature: None,
+                }),
+                &event_stream, cancellation_rx, cx,
+            );
+            assert!(result.expect_err("must not start tool").is::<ContextBudgetExceeded>());
+            assert!(!thread.pending_message().content.iter().any(|content| matches!(content, AgentMessageContent::ToolUse(_))));
+        });
     }
 
     async fn setup_thread_for_test(

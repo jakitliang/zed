@@ -1029,6 +1029,7 @@ fn into_copilot_responses(
         .max_output_tokens
         .and_then(|_| request.effective_max_output_tokens(model.max_output_tokens()));
     let LanguageModelRequest {
+        context_size: _,
         thread_id: _,
         prompt_cache_key: _,
         prompt_id: _,

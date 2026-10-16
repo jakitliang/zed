@@ -4240,6 +4240,7 @@ impl GitPanel {
                     tool_choice: None,
                     stop: Vec::new(),
                     temperature,
+                    context_size: None,
                     thinking_allowed: false,
                     thinking_effort: None,
                     speed: None,
