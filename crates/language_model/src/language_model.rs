@@ -425,6 +425,7 @@ pub trait LanguageModelClient: 'static {
                         let last_token_usage = last_token_usage.clone();
                         async move {
                             match result {
+                                Ok(LanguageModelCompletionEvent::ContextWindow(_)) => None,
                                 Ok(LanguageModelCompletionEvent::Queued { .. }) => None,
                                 Ok(LanguageModelCompletionEvent::Started) => None,
                                 Ok(LanguageModelCompletionEvent::StartMessage { .. }) => None,

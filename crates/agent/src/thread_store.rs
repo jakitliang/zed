@@ -158,6 +158,7 @@ mod tests {
             initial_project_snapshot: None,
             cumulative_token_usage: Default::default(),
             request_token_usage: HashMap::default(),
+            token_usage_snapshots: HashMap::default(),
             model: None,
             profile: None,
             subagent_context: None,

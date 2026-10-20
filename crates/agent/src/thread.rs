@@ -1411,11 +1411,14 @@ pub struct Thread {
     pending_message: Option<AgentMessage>,
     pub(crate) tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
     request_token_usage: HashMap<ClientUserMessageId, language_model::TokenUsage>,
+    token_usage_snapshots: HashMap<ClientUserMessageId, Option<acp_thread::TokenUsage>>,
     cumulative_token_usage: TokenUsage,
     /// The per-field maximum usage snapshot already added to
     /// `cumulative_token_usage` for the in-flight completion request. Reset at
     /// the start of each request.
     current_request_token_usage: TokenUsage,
+    current_request_context_window: Option<Option<u64>>,
+    observed_context_window: Option<u64>,
     pending_compaction_telemetry: Option<CompactionTelemetry>,
     #[allow(unused)]
     initial_project_snapshot: Shared<Task<Option<Arc<ProjectSnapshot>>>>,
@@ -1563,8 +1566,11 @@ impl Thread {
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
+            token_usage_snapshots: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
             current_request_token_usage: TokenUsage::default(),
+            current_request_context_window: None,
+            observed_context_window: None,
             pending_compaction_telemetry: None,
             initial_project_snapshot: {
                 let project_snapshot = Self::project_snapshot(project.clone(), cx);
@@ -1943,8 +1949,11 @@ impl Thread {
             pending_message: None,
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
+            token_usage_snapshots: db_thread.token_usage_snapshots,
             cumulative_token_usage: db_thread.cumulative_token_usage,
             current_request_token_usage: TokenUsage::default(),
+            current_request_context_window: None,
+            observed_context_window: None,
             pending_compaction_telemetry: None,
             initial_project_snapshot: Task::ready(db_thread.initial_project_snapshot).shared(),
             context_server_registry,
@@ -2057,6 +2066,7 @@ impl Thread {
             initial_project_snapshot: None,
             cumulative_token_usage: self.cumulative_token_usage,
             request_token_usage: self.request_token_usage.clone(),
+            token_usage_snapshots: self.token_usage_snapshots.clone(),
             model: (&self.model).into(),
             profile: Some(self.profile_id.clone()),
             subagent_context: self.subagent_context.clone(),
@@ -2146,6 +2156,9 @@ impl Thread {
         context_size: language_model::ContextSize,
         cx: &mut Context<Self>,
     ) {
+        if self.context_size != context_size {
+            self.observed_context_window = None;
+        }
         self.context_size = context_size;
         cx.notify();
     }
@@ -2169,6 +2182,11 @@ impl Thread {
 
     pub fn set_model(&mut self, model: LanguageModel, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
+        if self.model().is_none_or(|current| {
+            current.provider_id != model.provider_id || current.id != model.id
+        }) {
+            self.observed_context_window = None;
+        }
         self.model = ThreadModel::Ready(model.clone());
         let new_caps = Self::prompt_capabilities(self.model.as_model());
         let new_usage = self.latest_token_usage();
@@ -2530,6 +2548,7 @@ impl Thread {
 
         self.request_token_usage
             .insert(last_user_message.id.clone(), update);
+        self.snapshot_token_usage();
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
     }
@@ -2555,6 +2574,7 @@ impl Thread {
                 ..Default::default()
             },
         );
+        self.snapshot_token_usage();
         cx.emit(TokenUsageUpdated(self.latest_token_usage()));
         cx.notify();
     }
@@ -2578,6 +2598,7 @@ impl Thread {
             match &*message {
                 Message::User(message) => {
                     self.request_token_usage.remove(&message.id);
+                    self.token_usage_snapshots.remove(&message.id);
                 }
                 Message::Agent(_) | Message::Resume | Message::Compaction(_) => {}
             }
@@ -2608,12 +2629,30 @@ impl Thread {
     }
 
     pub fn latest_token_usage(&self) -> Option<acp_thread::TokenUsage> {
+        let message = self.last_user_message()?;
+        self.token_usage_snapshots
+            .get(&message.id)
+            .cloned()
+            .unwrap_or_else(|| self.current_token_usage_display())
+    }
+
+    fn snapshot_token_usage(&mut self) {
+        if let Some(message) = self.last_user_message() {
+            self.token_usage_snapshots
+                .insert(message.id.clone(), self.current_token_usage_display());
+        }
+    }
+
+    fn current_token_usage_display(&self) -> Option<acp_thread::TokenUsage> {
         let usage = self.latest_request_token_usage()?;
         let model = self.model()?;
         let input_tokens = total_input_tokens(usage);
 
         Some(acp_thread::TokenUsage {
-            max_tokens: model.max_token_count(),
+            max_tokens: self
+                .current_request_context_window
+                .unwrap_or(Some(model.max_token_count()))
+                .unwrap_or(0),
             max_output_tokens: model.max_output_tokens(),
             used_tokens: usage.total_tokens(),
             input_tokens,
@@ -3036,15 +3075,10 @@ impl Thread {
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model);
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
-                let budget = if model.provider_id().0.as_ref() == "ollama" {
-                    let capacity = this
-                        .context_size
-                        .num_ctx(model.context_window_limit.unwrap_or(model.max_token_count))
-                        .unwrap_or(model.max_token_count);
-                    Some(ContextBudget::new(capacity, &request)?)
-                } else {
-                    None
-                };
+                let budget = this
+                    .context_budget_capacity(&model)
+                    .map(|capacity| ContextBudget::new(capacity, &request))
+                    .transpose()?;
                 if let Some(budget) = budget.as_ref() {
                     budget.check()?;
                 }
@@ -3052,6 +3086,7 @@ impl Thread {
                     turn.context_budget = budget;
                 }
                 this.current_request_token_usage = TokenUsage::default();
+                this.current_request_context_window = None;
                 anyhow::Ok((model, provider, request))
             })??;
 
@@ -3481,6 +3516,7 @@ impl Thread {
                     | LanguageModelCompletionEvent::ToolUse(_)
                     | LanguageModelCompletionEvent::ToolUseJsonParseError { .. }
                     | LanguageModelCompletionEvent::StartMessage { .. }
+                    | LanguageModelCompletionEvent::ContextWindow(_)
                     | LanguageModelCompletionEvent::Compaction(_) => {}
                 }
             }
@@ -3521,6 +3557,10 @@ impl Thread {
                         this.messages.push(compaction);
                     }
                 }
+                if let Some(message) = this.last_user_message() {
+                    this.token_usage_snapshots.insert(message.id.clone(), None);
+                }
+                cx.emit(TokenUsageUpdated(None));
                 cx.notify();
             })?;
 
@@ -3711,11 +3751,43 @@ impl Thread {
             Stop(StopReason::Refusal) => return Err(CompletionError::Refusal.into()),
             Stop(StopReason::MaxTokens) => return Err(CompletionError::MaxTokens.into()),
             Stop(StopReason::ToolUse | StopReason::EndTurn) => {}
+            ContextWindow(capacity) => {
+                self.current_request_context_window = Some(capacity);
+                self.observed_context_window = capacity.filter(|capacity| *capacity > 0);
+                if self.context_size == language_model::ContextSize::Auto
+                    && let Some(turn) = self.running_turn.as_mut()
+                {
+                    if let Some(capacity) = self.observed_context_window {
+                        if let Some(budget) = turn.context_budget.as_mut() {
+                            budget.capacity = capacity;
+                        } else {
+                            turn.context_budget = Some(ContextBudget::new(
+                                capacity,
+                                &LanguageModelRequest::default(),
+                            )?);
+                        }
+                    } else {
+                        turn.context_budget = None;
+                    }
+                }
+            }
             Started | Queued { .. } | Compaction(_) => {}
         }
 
         self.check_context_budget(cx)?;
         Ok(None)
+    }
+
+    fn context_budget_capacity(&self, model: &LanguageModel) -> Option<u64> {
+        if model.provider_id().0.as_ref() != "ollama" {
+            return None;
+        }
+        if self.context_size == language_model::ContextSize::Auto {
+            // The unloaded runner's 4096 fallback is not a confirmed Auto limit.
+            self.observed_context_window
+        } else {
+            self.context_size.num_ctx(model.context_window_limit?)
+        }
     }
 
     fn check_context_budget(&self, cx: &App) -> Result<()> {
@@ -4798,6 +4870,12 @@ impl Thread {
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(&model, cx),
             messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
+            context_size: self
+                .model()
+                .filter(|current| {
+                    current.provider_id == model.provider_id && current.id == model.id
+                })
+                .map(|_| self.context_size),
             ..Default::default()
         };
 
@@ -7302,6 +7380,103 @@ mod tests {
         assert_eq!(estimated_token_units("中文"), 8);
     }
 
+    #[gpui::test]
+    async fn context_budget_fresh_auto_does_not_enforce_fallback_capacity(cx: &mut TestAppContext) {
+        let (thread, event_stream, fake) = setup_thread_for_test(cx).await;
+        let mut model = fake.model("granite-8b");
+        model.provider_id = LanguageModelProviderId::new("ollama");
+        model.max_token_count = 4096;
+        model.context_window_limit = Some(131072);
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "hello"));
+            let mut request = thread
+                .build_completion_request(CompletionIntent::UserPrompt, cx)
+                .expect("request");
+            request.tools.push(LanguageModelRequestTool::function(
+                "read".into(),
+                "tool documentation ".repeat(1000),
+                json!({"type":"object"}),
+                false,
+            ));
+            let capacity = thread
+                .context_size
+                .num_ctx(model.context_window_limit.expect("limit"))
+                .unwrap_or(model.max_token_count);
+            let budget = ContextBudget::new(capacity, &request).expect("budget");
+            assert!(
+                budget
+                    .check()
+                    .expect_err("fallback incorrectly blocks request")
+                    .is::<ContextBudgetExceeded>()
+            );
+            assert_eq!(thread.context_budget_capacity(&model), None);
+            thread.observed_context_window = Some(65536);
+            assert_eq!(thread.context_budget_capacity(&model), Some(65536));
+            thread.set_context_size(language_model::ContextSize::Quarter, cx);
+            assert_eq!(thread.context_budget_capacity(&model), Some(32768));
+            thread.set_context_size(language_model::ContextSize::Auto, cx);
+            assert_eq!(thread.context_budget_capacity(&model), None);
+            thread.observed_context_window = Some(65536);
+            thread.set_model(fake.model("other-model"), cx);
+            assert_eq!(thread.observed_context_window, None);
+            thread.set_model(model, cx);
+            let (cancellation_tx, cancellation_rx) = watch::channel(false);
+            thread.running_turn = Some(RunningTurn::new(
+                event_stream.clone(),
+                BTreeMap::default(),
+                cancellation_tx,
+                Task::ready(()),
+            ));
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::ContextWindow(Some(65536)),
+                    &event_stream,
+                    cancellation_rx.clone(),
+                    cx,
+                )
+                .expect("observe capacity");
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                        input_tokens: 5676,
+                        output_tokens: 100,
+                        ..Default::default()
+                    }),
+                    &event_stream,
+                    cancellation_rx.clone(),
+                    cx,
+                )
+                .expect("first response within observed capacity");
+            let budget = thread
+                .running_turn
+                .as_ref()
+                .and_then(|turn| turn.context_budget.as_ref())
+                .expect("observed budget");
+            assert_eq!(budget.capacity, 65536);
+            assert_eq!(budget.input_units, 5676 * 4);
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::ContextWindow(None),
+                    &event_stream,
+                    cancellation_rx,
+                    cx,
+                )
+                .expect("unknown observation");
+            assert_eq!(thread.observed_context_window, None);
+            assert!(
+                thread
+                    .running_turn
+                    .as_ref()
+                    .expect("turn")
+                    .context_budget
+                    .is_none()
+            );
+        });
+    }
+
     #[test]
     fn compaction_capacity_respects_prompt_and_combined_limits() {
         assert_eq!(
@@ -7352,6 +7527,219 @@ mod tests {
             );
             assert!(result.expect_err("must not start tool").is::<ContextBudgetExceeded>());
             assert!(!thread.pending_message().content.iter().any(|content| matches!(content, AgentMessageContent::ToolUse(_))));
+        });
+    }
+
+    #[gpui::test]
+    async fn token_usage_auto_compaction_invalidates_same_message_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let request = thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "question"));
+            thread.messages.push(agent_text_message("answer"));
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 34000,
+                    ..Default::default()
+                },
+                cx,
+            );
+            thread.build_compaction_request(thread.messages.len(), &model, cx)
+        });
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            let model = model.clone();
+            let request = request.clone();
+            async move |mut cx| {
+                let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+                Thread::stream_compaction(
+                    &thread,
+                    &event_stream,
+                    cancellation_rx,
+                    model,
+                    request,
+                    CompactionInsertion::Auto { insertion_ix: 2 },
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        cx.run_until_parked();
+        fake.send_text(&model, &request, "summary");
+        fake.end_stream(&model, &request);
+        assert!(matches!(
+            task.await.expect("compaction"),
+            ControlFlow::Continue(())
+        ));
+        let saved = thread
+            .update(cx, |thread, cx| {
+                assert_eq!(thread.latest_token_usage(), None);
+                assert!(thread.latest_request_token_usage().is_some());
+                thread.to_db(cx)
+            })
+            .await;
+        let saved: DbThread =
+            serde_json::from_str(&serde_json::to_string(&saved).expect("serialize"))
+                .expect("restore");
+        assert!(matches!(
+            saved.token_usage_snapshots.values().next(),
+            Some(None)
+        ));
+    }
+
+    #[gpui::test]
+    async fn token_usage_snapshot_survives_restart(cx: &mut TestAppContext) {
+        let (thread, _, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 65536;
+        });
+        let message_id = ClientUserMessageId::new();
+        let database_task = thread.update(cx, |thread, cx| {
+            thread.set_model(model, cx);
+            thread
+                .messages
+                .push(user_text_message(message_id.clone(), "question"));
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 33000,
+                    output_tokens: 1000,
+                    ..Default::default()
+                },
+                cx,
+            );
+            thread.to_db(cx)
+        });
+        let saved = database_task.await;
+        let json = serde_json::to_string(&saved).expect("serialize thread");
+        let saved: DbThread = serde_json::from_str(&json).expect("deserialize thread");
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 4096;
+        });
+        let restored = cx.new(|cx| {
+            let original = thread.read(cx);
+            Thread::from_db(
+                original.id.clone(),
+                saved,
+                original.project.clone(),
+                original.project_context.clone(),
+                original.context_server_registry.clone(),
+                original.templates.clone(),
+                cx,
+            )
+        });
+        restored.update(cx, |thread, cx| {
+            thread.set_model(model, cx);
+            let usage = thread.latest_token_usage().expect("restored usage");
+            assert_eq!(usage.used_tokens, 34000);
+            assert_eq!(usage.max_tokens, 65536);
+            assert_eq!(thread.model().expect("model").max_token_count, 4096);
+            assert_eq!(thread.context_size(), language_model::ContextSize::Auto);
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+                cx,
+            );
+            let usage = thread.latest_token_usage().expect("new usage");
+            assert_eq!(usage.used_tokens, 110);
+            assert_eq!(usage.max_tokens, 4096);
+        });
+    }
+
+    #[gpui::test]
+    async fn token_usage_snapshot_uses_completion_capacity(cx: &mut TestAppContext) {
+        let (thread, event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| model.max_token_count = 32768);
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model, cx);
+            thread
+                .messages
+                .push(user_text_message(ClientUserMessageId::new(), "question"));
+            let (_, cancellation_rx) = watch::channel(false);
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::ContextWindow(Some(65536)),
+                    &event_stream,
+                    cancellation_rx,
+                    cx,
+                )
+                .expect("capacity event");
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 34000,
+                    output_tokens: 1000,
+                    ..Default::default()
+                },
+                cx,
+            );
+            let usage = thread.latest_token_usage().expect("usage");
+            assert_eq!(usage.max_tokens, 65536);
+            assert_eq!(usage.used_tokens, 35000);
+            assert_eq!(thread.model().expect("model").max_token_count, 32768);
+        });
+        let model = fake.update_model("fake", |model| model.max_token_count = 4096);
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model, cx);
+            assert_eq!(
+                thread
+                    .latest_token_usage()
+                    .expect("historical usage")
+                    .max_tokens,
+                65536
+            );
+            let model = thread.model().expect("model");
+            assert_eq!(
+                thread
+                    .build_compaction_request(thread.messages.len(), model, cx)
+                    .context_size,
+                Some(language_model::ContextSize::Auto)
+            );
+            thread.context_size = language_model::ContextSize::Half;
+            let model = thread.model().expect("model");
+            assert_eq!(
+                thread
+                    .build_compaction_request(thread.messages.len(), model, cx)
+                    .context_size,
+                Some(language_model::ContextSize::Half)
+            );
+            let other_model = fake.model("compaction");
+            assert_eq!(
+                thread
+                    .build_compaction_request(thread.messages.len(), &other_model, cx)
+                    .context_size,
+                None
+            );
+            let (_, cancellation_rx) = watch::channel(false);
+            thread
+                .handle_completion_event(
+                    LanguageModelCompletionEvent::ContextWindow(None),
+                    &event_stream,
+                    cancellation_rx,
+                    cx,
+                )
+                .expect("unknown capacity event");
+            thread.update_token_usage(
+                TokenUsage {
+                    input_tokens: 100,
+                    ..Default::default()
+                },
+                cx,
+            );
+            let usage = thread.latest_token_usage().expect("known usage with unknown capacity");
+            assert_eq!(usage.used_tokens, 100);
+            assert_eq!(usage.max_tokens, 0);
+            let json = serde_json::to_string(&thread.token_usage_snapshots)
+                .expect("serialize unknown display");
+            let snapshots: HashMap<ClientUserMessageId, Option<acp_thread::TokenUsage>> =
+                serde_json::from_str(&json).expect("restore unknown display");
+            assert!(matches!(snapshots.values().next(), Some(Some(usage)) if usage.used_tokens == 100 && usage.max_tokens == 0));
         });
     }
 
@@ -8035,6 +8423,13 @@ mod tests {
     #[gpui::test]
     async fn test_manual_compact_forces_summary(cx: &mut TestAppContext) {
         let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let usage_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let usage_events = usage_events.clone();
+            cx.subscribe(&thread, move |_, event: &TokenUsageUpdated, _| {
+                usage_events.lock().push(event.0.clone());
+            })
+        });
         // A context window below the minimum and no recorded token usage would
         // both disable *automatic* compaction. Manual compaction forces it anyway.
         let model = fake.update_model("fake", |model| {
@@ -8053,6 +8448,15 @@ mod tests {
                 thread.messages.push(agent_text_message("old assistant"));
                 // Auto-compaction would be a no-op here.
                 assert_eq!(thread.compaction_message_target_ix(cx), None);
+                thread.context_size = language_model::ContextSize::Half;
+                thread.update_token_usage(
+                    TokenUsage {
+                        input_tokens: 34000,
+                        output_tokens: 1000,
+                        ..Default::default()
+                    },
+                    cx,
+                );
             });
         });
 
@@ -8066,6 +8470,10 @@ mod tests {
         cx.run_until_parked();
 
         let compaction_request = fake.pending_completions().pop().unwrap();
+        assert_eq!(
+            compaction_request.context_size,
+            Some(language_model::ContextSize::Half)
+        );
         assert_eq!(
             compaction_request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
@@ -8084,8 +8492,10 @@ mod tests {
         // marker, and no follow-up model turn is requested — `/compact` only
         // compacts.
         assert!(fake.pending_completions().is_empty());
+        assert!(matches!(usage_events.lock().last(), Some(None)));
         cx.update(|cx| {
             thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.latest_token_usage(), None);
                 assert!(matches!(&*thread.messages[0], Message::User(_)));
                 assert!(matches!(&*thread.messages[1], Message::Agent(_)));
                 assert!(matches!(

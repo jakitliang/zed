@@ -26,6 +26,9 @@ use settings::{Settings, SettingsStore, update_settings_file};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use ui::{
     ButtonLike, ButtonLink, ConfiguredApiCard, Divider, List, ListBulletItem, Tooltip, prelude::*,
@@ -45,6 +48,41 @@ const API_KEY_ENV_VAR_NAME: &str = "OLLAMA_API_KEY";
 static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 const RUNTIME_CONTEXT_TTL: Duration = Duration::from_secs(60);
 
+#[derive(Default)]
+struct CompletionCapacityObservations {
+    active: Mutex<HashMap<(String, String), Vec<Weak<AtomicBool>>>>,
+}
+
+impl CompletionCapacityObservations {
+    fn begin(&self, api_url: &str, model_name: &str) -> Arc<AtomicBool> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let observations = active
+            .entry((
+                api_url.to_owned(),
+                model_name
+                    .strip_suffix(":latest")
+                    .unwrap_or(model_name)
+                    .to_owned(),
+            ))
+            .or_default();
+        observations.retain(|observation| {
+            if let Some(overlapped) = observation.upgrade() {
+                // A completed competing request still invalidates the older observation.
+                overlapped.store(true, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        });
+        let overlapped = Arc::new(AtomicBool::new(!observations.is_empty()));
+        observations.push(Arc::downgrade(&overlapped));
+        overlapped
+    }
+}
+
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct OllamaSettings {
     pub api_url: String,
@@ -59,6 +97,7 @@ pub struct OllamaLanguageModelProvider {
     state: Entity<State>,
     request_limiters: ModelRateLimiters,
     completion_notifications: mpsc::UnboundedSender<u64>,
+    capacity_observations: Arc<CompletionCapacityObservations>,
 }
 
 pub struct State {
@@ -396,6 +435,7 @@ impl OllamaLanguageModelProvider {
             }),
             request_limiters: ModelRateLimiters::default(),
             completion_notifications,
+            capacity_observations: Arc::default(),
         };
         this
     }
@@ -694,8 +734,14 @@ impl LanguageModelClient for OllamaLanguageModelProvider {
                 )
             });
         let notifications = self.completion_notifications.clone();
+        let executor = cx.background_executor().clone();
+        let model_name = config.name.clone();
+        let model_digest = config.digest.clone();
+        let requested_context_window = request.options.as_ref().and_then(|options| options.num_ctx);
+        let capacity_observations = self.capacity_observations.clone();
 
         let future = request_limiter.stream(async move {
+            let overlapped = capacity_observations.begin(&api_url, &model_name);
             let stream = stream_chat_completion(
                 http_client.as_ref(),
                 &api_url,
@@ -715,7 +761,40 @@ impl LanguageModelClient for OllamaLanguageModelProvider {
                     }
                 })
                 .boxed();
-            let stream = map_to_language_model_completion_events(stream);
+            let stream = map_to_language_model_completion_events(stream).then(move |event| {
+                let http_client = http_client.clone();
+                let api_url = api_url.clone();
+                let api_key = api_key.clone();
+                let extra_headers = extra_headers.clone();
+                let model_name = model_name.clone();
+                let model_digest = model_digest.clone();
+                let executor = executor.clone();
+                let overlapped = overlapped.clone();
+                async move {
+                    let mut events = Vec::new();
+                    if matches!(&event, Ok(LanguageModelCompletionEvent::UsageUpdate(_))) {
+                        let observation = get_running_models(http_client.as_ref(), &api_url, api_key.as_deref(), &extra_headers).fuse();
+                        let timeout = executor.timer(Duration::from_secs(2)).fuse();
+                        futures::pin_mut!(observation, timeout);
+                        let result = futures::select! {
+                            result = observation => result,
+                            () = timeout => Err(anyhow!("Ollama completion capacity query timed out")),
+                        };
+                        let capacity = match result {
+                            Ok(models) => models.context_length_for(&model_name, model_digest.as_deref())
+                                .filter(|capacity| !overlapped.load(Ordering::SeqCst)
+                                    && requested_context_window.is_none_or(|requested| requested == *capacity)),
+                            Err(error) => {
+                                log::warn!("Unable to observe completion context capacity: {error}");
+                                None
+                            }
+                        };
+                        events.push(Ok(LanguageModelCompletionEvent::ContextWindow(capacity)));
+                    }
+                    events.push(event);
+                    events
+                }
+            }).flat_map(stream::iter);
             Ok(stream)
         });
 
@@ -1772,9 +1851,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn completed_chat_refreshes_capacity_without_changing_events(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn completed_chat_observes_capacity_before_usage(cx: &mut gpui::TestAppContext) {
         use futures::{AsyncReadExt, TryStreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1836,7 +1913,7 @@ mod tests {
             .try_collect()
             .await
             .expect("completion events");
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
         assert!(matches!(&events[0], LanguageModelCompletionEvent::Text(text) if text == "hello"));
         assert!(
             matches!(&events[1], LanguageModelCompletionEvent::Thinking { text, .. } if text == "reasoning")
@@ -1844,16 +1921,196 @@ mod tests {
         assert!(
             matches!(&events[2], LanguageModelCompletionEvent::ToolUse(tool) if tool.name.as_ref() == "example")
         );
+        assert!(matches!(
+            &events[3],
+            LanguageModelCompletionEvent::ContextWindow(Some(8192))
+        ));
         assert!(
-            matches!(&events[3], LanguageModelCompletionEvent::UsageUpdate(usage) if usage.input_tokens == 12 && usage.output_tokens == 3)
+            matches!(&events[4], LanguageModelCompletionEvent::UsageUpdate(usage) if usage.input_tokens == 12 && usage.output_tokens == 3)
         );
         assert!(matches!(
-            &events[4],
+            &events[5],
             LanguageModelCompletionEvent::Stop(StopReason::ToolUse)
         ));
         cx.run_until_parked();
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
         cx.update(|cx| assert_eq!(provider.provided_models(cx).remove(0).max_token_count, 8192));
+        drop(provider);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn completed_chat_keeps_usage_when_capacity_is_unknown(cx: &mut gpui::TestAppContext) {
+        use futures::TryStreamExt;
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let http_client = http_client::FakeHttpClient::create(|request| async move {
+            match request.uri().path() {
+                "/api/chat" => Ok(http_client::Response::builder().status(200).body(
+                    http_client::AsyncBody::from(
+                        serde_json::json!({
+                            "model":"model", "created_at":"", "done":true,
+                            "prompt_eval_count":12,"eval_count":3,
+                            "message":{"role":"assistant","content":"answer"}
+                        })
+                        .to_string(),
+                    ),
+                )?),
+                "/api/ps" => Err(anyhow!("runtime observation unavailable")),
+                path => panic!("Unexpected endpoint {path}"),
+            }
+        });
+        let provider = cx.update(|cx| {
+            OllamaLanguageModelProvider::new(http_client, Arc::new(TestCredentialsProvider), cx)
+        });
+        provider.state.update(cx, |state, _| {
+            state.fetched_models = vec![ollama::Model::new(
+                "model:latest",
+                Some(131072),
+                Some(true),
+                None,
+                None,
+            )];
+        });
+        let model = cx.update(|cx| provider.provided_models(cx).remove(0));
+        let events: Vec<_> = provider
+            .stream_completion(&model, LanguageModelRequest::default(), &cx.to_async())
+            .await
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("events");
+        assert!(matches!(
+            events.get(1),
+            Some(LanguageModelCompletionEvent::ContextWindow(None))
+        ));
+        assert!(
+            matches!(events.get(2), Some(LanguageModelCompletionEvent::UsageUpdate(usage)) if usage.input_tokens == 12)
+        );
+        drop(provider);
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn capacity_observations_remember_overlap_and_release_dropped_streams() {
+        let observations = CompletionCapacityObservations::default();
+        let first = observations.begin("server", "model");
+        let unrelated = observations.begin("server", "other");
+        let other_server = observations.begin("other-server", "model");
+        assert!(!first.load(Ordering::SeqCst));
+        let second = observations.begin("server", "model:latest");
+        assert!(first.load(Ordering::SeqCst));
+        assert!(second.load(Ordering::SeqCst));
+        assert!(!unrelated.load(Ordering::SeqCst));
+        assert!(!other_server.load(Ordering::SeqCst));
+        drop(second);
+        assert!(first.load(Ordering::SeqCst));
+        drop(first);
+        assert!(!observations.begin("server", "model").load(Ordering::SeqCst));
+    }
+
+    #[gpui::test]
+    async fn overlapping_completions_do_not_attribute_runner_capacity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use futures::{AsyncReadExt, TryStreamExt};
+        use std::sync::atomic::AtomicU64;
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let runner_capacity = Arc::new(AtomicU64::new(32768));
+        let http_client = http_client::FakeHttpClient::create({
+            let runner_capacity = runner_capacity.clone();
+            move |mut request| {
+                let runner_capacity = runner_capacity.clone();
+                async move {
+                    let body = match request.uri().path() {
+                        "/api/chat" => {
+                            let mut body = String::new();
+                            request.body_mut().read_to_string(&mut body).await?;
+                            let body: serde_json::Value = serde_json::from_str(&body)?;
+                            let capacity = body["options"]["num_ctx"].as_u64().unwrap_or(32768);
+                            runner_capacity.store(capacity, Ordering::SeqCst);
+                            [
+                                serde_json::json!({"model":"model", "created_at":"", "done":false,
+                                    "message":{"role":"assistant","content":format!("generated at {capacity}")}}),
+                                serde_json::json!({"model":"model", "created_at":"", "done":true,
+                                    "prompt_eval_count":12000,"eval_count":100,
+                                    "message":{"role":"assistant","content":""}}),
+                            ].into_iter().map(|delta| delta.to_string()).collect::<Vec<_>>().join("\n")
+                        }
+                        "/api/ps" => serde_json::json!({"models":[{"name":"model:latest",
+                            "context_length":runner_capacity.load(Ordering::SeqCst)}]})
+                        .to_string(),
+                        path => panic!("Unexpected endpoint {path}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(body))?)
+                }
+            }
+        });
+        let provider = cx.update(|cx| {
+            OllamaLanguageModelProvider::new(http_client, Arc::new(TestCredentialsProvider), cx)
+        });
+        provider.state.update(cx, |state, _| {
+            state.fetched_models = vec![ollama::Model::new(
+                "model:latest",
+                Some(131072),
+                Some(true),
+                None,
+                None,
+            )];
+        });
+        let model = cx.update(|cx| provider.provided_models(cx).remove(0));
+        for context_size in [
+            language_model::ContextSize::Auto,
+            language_model::ContextSize::Quarter,
+        ] {
+            let mut first = provider
+                .stream_completion(
+                    &model,
+                    LanguageModelRequest {
+                        context_size: Some(context_size),
+                        ..Default::default()
+                    },
+                    &cx.to_async(),
+                )
+                .await
+                .expect("first stream");
+            assert!(matches!(first.next().await.expect("text").expect("event"),
+                LanguageModelCompletionEvent::Text(text) if text == "generated at 32768"));
+            let second: Vec<_> = provider
+                .stream_completion(
+                    &model,
+                    LanguageModelRequest {
+                        context_size: Some(language_model::ContextSize::Half),
+                        ..Default::default()
+                    },
+                    &cx.to_async(),
+                )
+                .await
+                .expect("second stream")
+                .try_collect()
+                .await
+                .expect("second events");
+            let first: Vec<_> = first.try_collect().await.expect("first events");
+            for events in [&first, &second] {
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    LanguageModelCompletionEvent::ContextWindow(None)
+                )));
+                assert!(events.iter().any(|event| matches!(event, LanguageModelCompletionEvent::UsageUpdate(usage) if usage.input_tokens == 12000)));
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    LanguageModelCompletionEvent::ContextWindow(Some(_))
+                )));
+            }
+        }
         drop(provider);
         cx.run_until_parked();
     }

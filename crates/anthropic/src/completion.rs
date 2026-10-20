@@ -99,7 +99,8 @@ pub async fn collect_compaction_result(
                     },
                 );
             }
-            LanguageModelCompletionEvent::Queued { .. }
+            LanguageModelCompletionEvent::ContextWindow(_)
+            | LanguageModelCompletionEvent::Queued { .. }
             | LanguageModelCompletionEvent::Started
             | LanguageModelCompletionEvent::Text(_)
             | LanguageModelCompletionEvent::Thinking { .. }

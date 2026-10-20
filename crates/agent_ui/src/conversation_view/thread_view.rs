@@ -5031,8 +5031,27 @@ impl ThreadView {
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
-        let usage = thread.token_usage()?;
-        let show_split = self.supports_split_token_display(cx);
+        let Some(usage) = thread.token_usage() else {
+            let native_thread = self.as_native_thread(cx)?;
+            if native_thread.read(cx).is_empty() {
+                return None;
+            }
+            return Some(
+                h_flex()
+                    .id("context_usage_pending")
+                    .mr_1()
+                    .child(
+                        Icon::new(IconName::Circle)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(
+                        "Context usage is awaiting an updated measurement",
+                    ))
+                    .into_any_element(),
+            );
+        };
+        let show_split = usage.max_tokens > 0 && self.supports_split_token_display(cx);
 
         let cost_label = thread.cost().map(|cost| {
             let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
@@ -5052,7 +5071,11 @@ impl ThreadView {
         };
 
         let used = crate::humanize_token_count(usage.used_tokens);
-        let max = crate::humanize_token_count(usage.max_tokens);
+        let max = if usage.max_tokens == 0 {
+            "Unknown".to_string()
+        } else {
+            crate::humanize_token_count(usage.max_tokens)
+        };
         let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
         let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
 
@@ -5065,7 +5088,11 @@ impl ThreadView {
         let ring_size = px(16.0);
         let stroke_width = px(2.);
 
-        let percentage = format!("{}%", (progress_ratio * 100.0).round() as u32);
+        let percentage = if usage.max_tokens == 0 {
+            "Unknown".to_string()
+        } else {
+            format!("{}%", (progress_ratio * 100.0).round() as u32)
+        };
 
         let tooltip_separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
 
@@ -5138,7 +5165,20 @@ impl ThreadView {
             }
         };
 
-        if show_split {
+        if usage.max_tokens == 0 {
+            Some(
+                h_flex()
+                    .id("context_capacity_unknown")
+                    .mr_1()
+                    .child(
+                        Icon::new(IconName::Circle)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .hoverable_tooltip(build_tooltip)
+                    .into_any_element(),
+            )
+        } else if show_split {
             let input_max_raw = max_input_tokens;
             let output_max_raw = max_output_tokens;
 

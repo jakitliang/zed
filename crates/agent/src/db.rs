@@ -64,6 +64,9 @@ pub struct DbThread {
     #[serde(default)]
     pub request_token_usage: HashMap<acp_thread::ClientUserMessageId, language_model::TokenUsage>,
     #[serde(default)]
+    pub token_usage_snapshots:
+        HashMap<acp_thread::ClientUserMessageId, Option<acp_thread::TokenUsage>>,
+    #[serde(default)]
     pub model: Option<DbLanguageModel>,
     #[serde(default)]
     pub profile: Option<AgentProfileId>,
@@ -159,6 +162,7 @@ impl SharedThread {
             initial_project_snapshot: None,
             cumulative_token_usage: Default::default(),
             request_token_usage: Default::default(),
+            token_usage_snapshots: Default::default(),
             model: self.model,
             profile: None,
             subagent_context: None,
@@ -345,6 +349,7 @@ impl DbThread {
             initial_project_snapshot: thread.initial_project_snapshot,
             cumulative_token_usage: thread.cumulative_token_usage,
             request_token_usage,
+            token_usage_snapshots: Default::default(),
             model: thread.model,
             profile: thread.profile,
             subagent_context: None,
@@ -816,6 +821,7 @@ mod tests {
             initial_project_snapshot: None,
             cumulative_token_usage: Default::default(),
             request_token_usage: HashMap::default(),
+            token_usage_snapshots: HashMap::default(),
             model: None,
             profile: None,
             subagent_context: None,
@@ -827,6 +833,17 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
         }
+    }
+
+    #[test]
+    fn token_usage_snapshot_legacy_thread_defaults() {
+        let thread = make_thread("legacy", Utc::now());
+        let mut json = serde_json::to_value(thread).expect("serialize thread");
+        json.as_object_mut()
+            .expect("object")
+            .remove("token_usage_snapshots");
+        let restored: DbThread = serde_json::from_value(json).expect("legacy thread");
+        assert!(restored.token_usage_snapshots.is_empty());
     }
 
     #[gpui::test]

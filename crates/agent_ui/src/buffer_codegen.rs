@@ -1352,7 +1352,8 @@ impl CodegenAlternative {
                         return;
                     }
                     Ok(
-                        LanguageModelCompletionEvent::Queued { .. }
+                        LanguageModelCompletionEvent::ContextWindow(_)
+                        | LanguageModelCompletionEvent::Queued { .. }
                         | LanguageModelCompletionEvent::Started
                         | LanguageModelCompletionEvent::Text(_)
                         | LanguageModelCompletionEvent::Thinking { .. }
@@ -1426,7 +1427,8 @@ impl CodegenAlternative {
                             }
                         }
                         Ok(
-                            LanguageModelCompletionEvent::Queued { .. }
+                            LanguageModelCompletionEvent::ContextWindow(_)
+                            | LanguageModelCompletionEvent::Queued { .. }
                             | LanguageModelCompletionEvent::Started
                             | LanguageModelCompletionEvent::Text(_)
                             | LanguageModelCompletionEvent::Thinking { .. }

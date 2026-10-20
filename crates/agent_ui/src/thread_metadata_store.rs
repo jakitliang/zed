@@ -1842,6 +1842,7 @@ mod tests {
             initial_project_snapshot: None,
             cumulative_token_usage: Default::default(),
             request_token_usage: Default::default(),
+            token_usage_snapshots: Default::default(),
             model: None,
             profile: None,
             subagent_context: None,

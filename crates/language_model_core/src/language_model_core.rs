@@ -65,6 +65,8 @@ pub enum LanguageModelCompletionEvent {
     },
     ReasoningDetails(serde_json::Value),
     UsageUpdate(TokenUsage),
+    /// Runtime capacity observed after completion, or unknown; not a request override.
+    ContextWindow(Option<u64>),
     Compaction(CompactionUpdate),
 }
 
